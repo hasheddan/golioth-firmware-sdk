@@ -54,6 +54,7 @@ zephyr_library_sources(
     ../../src/golioth_lightdb.c
     ../../src/golioth_log.c
     ../../src/golioth_mbox.c
+    ../../src/golioth_memfault.c
     ../../src/golioth_ota.c
     ../../src/golioth_remote_shell.c
     ../../src/golioth_ringbuf.c
