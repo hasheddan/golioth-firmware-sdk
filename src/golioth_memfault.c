@@ -1,3 +1,8 @@
+/*
+ * Copyright (c) 2023 Golioth, Inc.
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ */
 
 #include "golioth_coap_client.h"
 #include "golioth_sys.h"
