@@ -47,6 +47,7 @@ zephyr_library_include_directories(
 zephyr_library_sources(
     # SDK
     ../../src/golioth_coap_client.c
+    ../../src/golioth_data.c
     ../../src/golioth_debug.c
     ../../src/golioth_event_group.c
     ../../src/golioth_fw_block_processor.c
