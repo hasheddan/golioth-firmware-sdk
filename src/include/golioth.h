@@ -15,6 +15,7 @@ extern "C" {
 #include "golioth_lightdb.h"
 #include "golioth_rpc.h"
 #include "golioth_ota.h"
+#include "golioth_data.h"
 #include "golioth_time.h"
 #include "golioth_fw_update.h"
 #include "golioth_settings.h"

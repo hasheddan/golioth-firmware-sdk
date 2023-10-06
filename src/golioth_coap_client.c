@@ -191,6 +191,37 @@ static coap_response_t coap_response_handler(
                             is_last,
                             req->get_block.arg);
                 }
+            } else if (req->type == GOLIOTH_COAP_REQUEST_POST_BLOCK) {
+                coap_opt_iterator_t opt_iter;
+                coap_opt_t* block_opt = coap_check_option(received, COAP_OPTION_BLOCK1, &opt_iter);
+
+                // Note: If there's only one block, then the server will not include the BLOCK2
+                // option in the response. So block_opt may be NULL here.
+
+                uint32_t opt_block_index = block_opt ? coap_opt_block_num(block_opt) : 0;
+                //bool is_last = block_opt ? (COAP_OPT_BLOCK_MORE(block_opt) == 0) : true;
+
+                GLTH_LOGD(
+                        TAG,
+                        "Request block index = %" PRIu32 ", response block index = %" PRIu32
+                        ", offset 0x%08" PRIX32,
+                        (uint32_t)req->get_block.block_index,
+                        (uint32_t)opt_block_index,
+                        opt_block_index * 1024);
+                GLTH_LOG_BUFFER_HEXDUMP(
+                        TAG, data, min(32, data_len), GOLIOTH_DEBUG_LOG_LEVEL_DEBUG);
+
+                if (req->post_block.callback) {
+                    // Don't want to use the callback right now...
+                    //req->post_block.callback(
+                    //        client,
+                    //        &response,
+                    //        req->path,
+                    //        data,
+                    //        data_len,
+                    //        is_last,
+                    //        req->get_block.arg);
+                }
             } else if (req->type == GOLIOTH_COAP_REQUEST_POST) {
                 if (req->post.callback) {
                     req->post.callback(client, &response, req->path, req->post.arg);
@@ -352,6 +383,20 @@ static void golioth_coap_add_accept(coap_pdu_t* request, uint32_t content_type) 
             typebuf);
 }
 
+static void golioth_coap_add_block1(coap_pdu_t* request, size_t block_index, size_t block_size) {
+    size_t szx = 6;  // 1024 bytes
+    coap_block_t block = {
+            .num = block_index,
+            .m = 0,
+            .szx = szx,
+    };
+
+    unsigned char buf[4];
+    unsigned int opt_length =
+            coap_encode_var_safe(buf, sizeof(buf), (block.num << 4 | block.m << 3 | block.szx));
+    coap_add_option(request, COAP_OPTION_BLOCK1, opt_length, buf);
+}
+
 static void golioth_coap_add_block2(coap_pdu_t* request, size_t block_index, size_t block_size) {
     size_t szx = 6;  // 1024 bytes
     coap_block_t block = {
@@ -444,6 +489,23 @@ static void golioth_coap_post(golioth_coap_request_msg_t* req, coap_session_t* s
     golioth_coap_add_path(req_pdu, req->path_prefix, req->path);
     golioth_coap_add_content_type(req_pdu, req->post.content_type);
     coap_add_data(req_pdu, req->post.payload_size, (unsigned char*)req->post.payload);
+    coap_send(session, req_pdu);
+    GSTATS_INC_FREE("post_pdu");
+}
+
+static void golioth_coap_post_block(golioth_coap_request_msg_t* req, coap_session_t* session) {
+    coap_pdu_t* req_pdu = coap_new_pdu(COAP_MESSAGE_CON, COAP_REQUEST_POST, session);
+    if (!req_pdu) {
+        GLTH_LOGE(TAG, "coap_new_pdu() post failed");
+        return;
+    }
+    GSTATS_INC_ALLOC("post_pdu");
+
+    golioth_coap_add_token(req_pdu, req, session);
+    golioth_coap_add_path(req_pdu, req->path_prefix, req->path);
+    golioth_coap_add_block1(req_pdu, req->post_block.block_index, req->post_block.block_size);
+    golioth_coap_add_content_type(req_pdu, req->post_block.content_type);
+    coap_add_data(req_pdu, req->post_block.payload_size, (unsigned char*)req->post_block.payload);
     coap_send(session, req_pdu);
     GSTATS_INC_FREE("post_pdu");
 }
@@ -718,6 +780,13 @@ static golioth_status_t coap_io_loop_once(
             golioth_coap_post(&request_msg, session);
             assert(request_msg.post.payload);
             golioth_sys_free(request_msg.post.payload);
+            GSTATS_INC_FREE("request_payload");
+            break;
+        case GOLIOTH_COAP_REQUEST_POST_BLOCK:
+            GLTH_LOGD(TAG, "Handle POST_BLOCK %s", request_msg.path);
+            golioth_coap_post_block(&request_msg, session);
+            assert(request_msg.post_block.payload);
+            golioth_sys_free(request_msg.post_block.payload);
             GSTATS_INC_FREE("request_payload");
             break;
         case GOLIOTH_COAP_REQUEST_DELETE:
@@ -1224,6 +1293,108 @@ golioth_status_t golioth_coap_client_set(
             .ageout_ms = ageout_ms,
     };
     strncpy(request_msg.path, path, sizeof(request_msg.path) - 1);
+
+    if (is_synchronous) {
+        // Created here, deleted by coap thread (or here if fail to enqueue
+        request_msg.request_complete_event = golioth_event_group_create();
+        GSTATS_INC_ALLOC("request_complete_event");
+        request_msg.request_complete_ack_sem = golioth_sys_sem_create(1, 0);
+        GSTATS_INC_ALLOC("request_complete_ack_sem");
+    }
+
+    bool sent = golioth_mbox_try_send(c->request_queue, &request_msg);
+    if (!sent) {
+        GLTH_LOGW(TAG, "Failed to enqueue request, queue full");
+        if (payload_size > 0) {
+            golioth_sys_free(request_payload);
+            GSTATS_INC_FREE("request_payload");
+        }
+        if (is_synchronous) {
+            golioth_event_group_destroy(request_msg.request_complete_event);
+            GSTATS_INC_FREE("request_complete_event");
+            golioth_sys_sem_destroy(request_msg.request_complete_ack_sem);
+            GSTATS_INC_FREE("request_complete_ack_sem");
+        }
+        return GOLIOTH_ERR_QUEUE_FULL;
+    }
+
+    if (is_synchronous) {
+        int32_t tmo_ms = timeout_s * 1000;
+        if (timeout_s == GOLIOTH_WAIT_FOREVER) {
+            tmo_ms = GOLIOTH_WAIT_FOREVER;
+        }
+        uint32_t bits = golioth_event_group_wait_bits(
+                request_msg.request_complete_event,
+                RESPONSE_RECEIVED_EVENT_BIT | RESPONSE_TIMEOUT_EVENT_BIT,
+                true,  // clear bits after waiting
+                tmo_ms);
+
+        // Notify CoAP thread that we received the event
+        golioth_sys_sem_give(request_msg.request_complete_ack_sem);
+
+        if ((bits == 0) || (bits & RESPONSE_TIMEOUT_EVENT_BIT)) {
+            return GOLIOTH_ERR_TIMEOUT;
+        }
+    }
+    return GOLIOTH_OK;
+}
+
+#define IMG_PATH "/img"
+
+golioth_status_t golioth_coap_client_post_block(
+        golioth_client_t client,
+        uint32_t content_type,
+        const uint8_t* payload,
+        size_t payload_size,
+        bool is_synchronous,
+        int32_t timeout_s) {
+    golioth_coap_client_t* c = (golioth_coap_client_t*)client;
+    if (!c) {
+        return GOLIOTH_ERR_NULL;
+    }
+
+    uint8_t* request_payload = NULL;
+
+    if (!c->is_running) {
+        GLTH_LOGW(TAG, "Client not running, dropping request for path %s", IMG_PATH);
+        return GOLIOTH_ERR_INVALID_STATE;
+    }
+
+    if (payload_size > 0) {
+        // We will allocate memory and copy the payload
+        // to avoid payload lifetime and thread-safety issues.
+        //
+        // This memory will be free'd by the CoAP thread after handling the request,
+        // or in this function if we fail to enqueue the request.
+        request_payload = (uint8_t*)golioth_sys_malloc(payload_size);
+        if (!request_payload) {
+            GLTH_LOGE(TAG, "Payload alloc failure");
+            return GOLIOTH_ERR_MEM_ALLOC;
+        }
+        GSTATS_INC_ALLOC("request_payload");
+        memset(request_payload, 0, payload_size);
+        memcpy(request_payload, payload, payload_size);
+    }
+
+    uint64_t ageout_ms = GOLIOTH_WAIT_FOREVER;
+    if (timeout_s != GOLIOTH_WAIT_FOREVER) {
+        ageout_ms = golioth_time_millis() + (1000 * timeout_s);
+    }
+
+    golioth_coap_request_msg_t request_msg = {
+            .type = GOLIOTH_COAP_REQUEST_POST_BLOCK,
+            .path_prefix = "",
+            .path = IMG_PATH,
+            .post_block =
+                    {
+                            .content_type = content_type,
+                            .payload = request_payload,
+                            .payload_size = payload_size,
+                            .block_index = 0,
+                            .block_size = 1024,
+                    },
+            .ageout_ms = ageout_ms,
+    };
 
     if (is_synchronous) {
         // Created here, deleted by coap thread (or here if fail to enqueue
